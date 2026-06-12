@@ -20,6 +20,21 @@ from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 # ── query handler ─────────────────────────────────────────────────────────────
 
+def _format_listing(item: dict) -> str:
+    """Format a listing dict into a readable block for the 'Top listing' panel."""
+    lines = [
+        item["title"],
+        f"${item['price']:g} · {item['platform']}",
+        f"Size {item['size']} · {item['condition']}",
+        "Style: " + ", ".join(item["style_tags"]),
+    ]
+    if item.get("brand"):
+        lines.append(f"Brand: {item['brand']}")
+    lines.append("")  # blank line before the description
+    lines.append(item["description"])
+    return "\n".join(lines)
+
+
 def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     """
     Called by Gradio when the user submits a query.
@@ -43,8 +58,26 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # 1. Guard against an empty query.
+    if not user_query or not user_query.strip():
+        return "Please enter what you're looking for.", "", ""
+
+    # 2. Select the wardrobe based on the radio choice.
+    if wardrobe_choice == "Example wardrobe":
+        wardrobe = get_example_wardrobe()
+    else:
+        wardrobe = get_empty_wardrobe()
+
+    # 3. Run the agent.
+    session = run_agent(user_query, wardrobe)
+
+    # 4. On error, show the message in the first panel only.
+    if session["error"]:
+        return session["error"], "", ""
+
+    # 5. Format the results for the three panels.
+    listing_text = _format_listing(session["selected_item"])
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────

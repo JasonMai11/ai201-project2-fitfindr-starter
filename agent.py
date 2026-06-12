@@ -18,7 +18,135 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+import re
+
+from tools import (
+    search_listings,
+    refine_search,
+    suggest_outfit,
+    create_fit_card,
+    _get_groq_client,
+    _MODEL,
+)
+
+# Categories the LLM may tag a query with (must match the dataset's categories).
+_CATEGORIES = {"tops", "bottoms", "outerwear", "shoes", "accessories"}
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def parse_query(query: str) -> dict:
+    """
+    Extract structured search parameters from a natural-language query.
+
+    Returns a dict: {"description": str, "size": str | None,
+                     "max_price": float | None, "category": str | None}.
+
+    Primary path uses the Groq LLM (JSON mode), which understands intent and can
+    tell the item the user *wants* from items they merely mention owning/wearing
+    (e.g. "I wear shorts, I want a button shirt" → description "button shirt"),
+    and tags the request with a category so a "shirt" request can't return shoes.
+    If the call fails or returns malformed JSON, we fall back to the deterministic
+    regex parser so the agent never crashes.
+    """
+    system_prompt = (
+        "You extract structured search filters from a shopper's request for a "
+        "secondhand clothing item. Respond with a JSON object with exactly these "
+        "keys:\n"
+        '  "description": a short phrase for the ITEM THE USER WANTS TO BUY '
+        "(e.g. \"button shirt\", \"vintage graphic tee\"). Exclude anything they "
+        "say they already own or wear, and exclude size/price.\n"
+        '  "size": the requested size as a string, or null if none given.\n'
+        '  "max_price": the maximum price as a number, or null if none given.\n'
+        '  "category": the item type, one of "tops", "bottoms", "outerwear", '
+        '"shoes", "accessories", or null if unclear.\n'
+        "Return only the JSON object."
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content)
+
+        description = str(data.get("description") or "").strip()
+        if not description:
+            raise ValueError("LLM returned an empty description")
+
+        size = data.get("size")
+        size = str(size).strip() if size not in (None, "") else None
+
+        max_price = data.get("max_price")
+        max_price = float(max_price) if max_price not in (None, "") else None
+
+        # Only accept a category the dataset actually uses; otherwise ignore it.
+        category = data.get("category")
+        category = category.lower() if isinstance(category, str) else None
+        if category not in _CATEGORIES:
+            category = None
+
+        return {
+            "description": description,
+            "size": size,
+            "max_price": max_price,
+            "category": category,
+        }
+    except Exception:
+        # Network error, bad JSON, missing/invalid fields → deterministic fallback.
+        return _parse_query_regex(query)
+
+
+# Regex fallback — deterministic, no API call. Used if the LLM parse fails.
+
+# Price: prefer a keyworded amount ("under $30", "less than 25"), else any "$30".
+_KEYWORD_PRICE_RE = re.compile(
+    r"(?:under|below|less than|max(?:imum)?|<=?)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+_BARE_PRICE_RE = re.compile(r"\$\s*(\d+(?:\.\d{1,2})?)")
+# Size: "size M", "in size M", "size 8" → captures the token after "size".
+_SIZE_RE = re.compile(r"\bsize\s+([A-Za-z0-9/]+)", re.IGNORECASE)
+
+
+def _parse_query_regex(query: str) -> dict:
+    """Regex/string fallback parser (no LLM call). Same return shape as parse_query."""
+    spans_to_remove = []
+
+    # max_price
+    max_price = None
+    price_match = _KEYWORD_PRICE_RE.search(query) or _BARE_PRICE_RE.search(query)
+    if price_match:
+        max_price = float(price_match.group(1))
+        spans_to_remove.append(price_match.span())
+
+    # size
+    size = None
+    size_match = _SIZE_RE.search(query)
+    if size_match:
+        size = size_match.group(1)
+        spans_to_remove.append(size_match.span())
+
+    # description = query minus the matched price/size spans, whitespace collapsed
+    description = query
+    for start, end in sorted(spans_to_remove, reverse=True):
+        description = description[:start] + description[end:]
+    description = re.sub(r"\s+", " ", description).strip()
+
+    # Regex can't reliably infer a category — leave it None (shape stays consistent).
+    return {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
+        "category": None,
+    }
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +220,44 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: fresh session for this interaction.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse the query into description / size / max_price.
+    parsed = parse_query(query)
+    session["parsed"] = parsed
+
+    # Step 3: search the listings.
+    results = search_listings(
+        parsed["description"], parsed["size"], parsed["max_price"], parsed["category"]
+    )
+    session["search_results"] = results
+
+    # No results → retry with relaxed constraints (stretch tool) before giving up.
+    if not results:
+        results = refine_search(parsed)
+        session["search_results"] = results
+
+    # Still nothing → stop with a helpful message, before any LLM calls.
+    if not results:
+        session["error"] = (
+            f"No listings matched '{parsed['description']}'. "
+            "Try fewer keywords, a higher price, or removing the size filter."
+        )
+        return session
+
+    # Step 4: select the most relevant result.
+    session["selected_item"] = results[0]
+
+    # Step 5: suggest an outfit using the user's wardrobe.
+    session["outfit_suggestion"] = suggest_outfit(session["selected_item"], wardrobe)
+
+    # Step 6: turn the outfit into a shareable fit card.
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: done.
     return session
 
 
