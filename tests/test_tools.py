@@ -115,16 +115,47 @@ def test_refine_search_relaxes_size():
               "max_price": None, "category": "tops"}
     assert tools.search_listings(parsed["description"], parsed["size"],
                                  parsed["max_price"], parsed["category"]) == []
-    refined = tools.refine_search(parsed)
-    assert refined
-    assert all(item["category"] == "tops" for item in refined)
+    results, adjustment = tools.refine_search(parsed)
+    assert results
+    assert all(item["category"] == "tops" for item in results)
+    assert adjustment == "removed the size filter"
 
 
 def test_refine_search_exhausted_returns_empty():
     # Nothing matches the description at all → relaxing constraints can't help.
     parsed = {"description": "designer ballgown", "size": "XXS",
               "max_price": 5.0, "category": None}
-    assert tools.refine_search(parsed) == []
+    assert tools.refine_search(parsed) == ([], None)
+
+
+# ── compare_price (stretch) ───────────────────────────────────────────────────
+
+def test_compare_price_gives_verdict():
+    item = {"id": "lst_006", "category": "tops", "price": 24.0}
+    out = tools.compare_price(item)
+    assert "$24" in out
+    assert "tops" in out
+
+
+def test_compare_price_not_enough_comparables():
+    # A made-up category has no comparables → friendly message, no crash.
+    item = {"id": "x", "category": "spacesuits", "price": 999.0}
+    assert tools.compare_price(item) == "Not enough comparable listings to price-check this."
+
+
+# ── get_trends (stretch) ──────────────────────────────────────────────────────
+
+def test_get_trends_overall():
+    out = tools.get_trends()
+    assert "vintage" in out  # vintage is the most common tag in the dataset
+    assert out.endswith(".")
+
+
+def test_get_trends_size_scoped():
+    # Scoping to a size present in the data should still return tags.
+    out = tools.get_trends(size="M")
+    assert "in your size" in out
+    assert ":" in out
 
 
 # ── suggest_outfit ──────────────────────────────────────────────────────────

@@ -10,12 +10,14 @@ ai201-project2-fitfindr-starter/
 │   ├── listings.json          # 40 mock secondhand listings
 │   └── wardrobe_schema.json   # Wardrobe format + example wardrobe
 ├── utils/
-│   └── data_loader.py         # Helper functions for loading the data
-├── tools.py                   # The 3 required tools + refine_search (stretch)
+│   ├── data_loader.py         # Helper functions for loading the data
+│   └── profile.py             # Style profile memory (stretch feature C)
+├── tools.py                   # 3 required tools + 3 stretch tools
 ├── agent.py                   # Query parsing + run_agent planning loop
-├── app.py                     # Gradio web UI (handle_query)
+├── app.py                     # Gradio web UI (5 output panels)
 ├── tests/test_tools.py        # Tool tests (incl. one per failure mode)
 ├── tests/test_agent.py        # parse_query tests (LLM + regex fallback)
+├── tests/test_profile.py      # Style profile memory tests
 ├── planning.md                # Design spec (tools, loop, diagram)
 └── requirements.txt           # Python dependencies
 ```
@@ -103,10 +105,20 @@ The agent uses four tools. The first three are required; `refine_search` is a st
 - **Output:** `str` — a 2–4 sentence OOTD caption mentioning the item name, price, and platform.
 - **Purpose:** turn the outfit into social-post copy. Calls the LLM at high temperature so captions vary across runs.
 
-### `refine_search` — relax constraints when nothing matches (stretch)
+### `refine_search` — relax constraints when nothing matches (stretch A)
 - **Inputs:** `parsed: dict` (`description`, `size`, `max_price`, `category`).
-- **Output:** `list[dict]` — first non-empty result after relaxing, or `[]` if exhausted.
-- **Purpose:** keep a too-narrow query from dead-ending. Relaxes in stages: **drop size → drop price → relax category**.
+- **Output:** `tuple[list[dict], str | None]` — `(results, adjustment_label)`, where `adjustment_label` names what was loosened (e.g. `"removed the size filter"`) or is `None` if all stages failed.
+- **Purpose:** keep a too-narrow query from dead-ending. Relaxes in stages: **drop size → drop price → relax category**. The adjustment label powers the UI retry notice.
+
+### `compare_price` — check if an item's price is fair (stretch B)
+- **Inputs:** `item: dict` (a listing), `listings: list[dict] | None = None` (defaults to full dataset).
+- **Output:** `str` — a verdict sentence, e.g. `"At $24, this is a good price — similar tops run $15–$35 (typical ~$20)."` Returns a friendly "not enough data" message if fewer than 2 comparables exist; never raises.
+- **Purpose:** help the user evaluate whether to buy. Compares against same-category listings using the median price as the typical benchmark.
+
+### `get_trends` — surface popular styles in the dataset (stretch D)
+- **Inputs:** `size: str | None = None` (filter to listings that carry that size), `listings: list[dict] | None = None`.
+- **Output:** `str` — top-5 style tags by frequency, e.g. `"Trending in your size (from current listings): vintage, streetwear, y2k, denim, cottagecore."` If `size` is `None`, trends are overall.
+- **Purpose:** give the user style context without leaving the app. Derived from the marketplace dataset (not a live feed) and labeled as such.
 
 ## Planning Loop
 
@@ -114,25 +126,48 @@ The agent uses four tools. The first three are required; `refine_search` is a st
 
 1. **Parse** the query into `{description, size, max_price, category}` (see State Management).
 2. **Search** with `search_listings`. If it returns results, go to step 4.
-3. **Refine (branch):** if the search was empty, call `refine_search`. If still empty, set `session["error"]` and stop — never call the LLM tools on empty input.
+3. **Refine (branch):** if the search was empty, call `refine_search` (unpacks the `(results, adjustment)` tuple). If still empty, set `session["error"]` and stop — never call the LLM tools on empty input. If results come back, set `session["notice"]` with the adjustment label for the UI.
 4. **Select** the top (most relevant) result as `selected_item`.
-5. **Suggest** an outfit with `suggest_outfit`.
-6. **Caption** it with `create_fit_card`.
-7. **Return** the session.
+5. **Price check + trends:** run `compare_price` and `get_trends` (both offline, no API call).
+6. **Suggest** an outfit with `suggest_outfit`.
+7. **Caption** it with `create_fit_card`.
+8. **Return** the session.
 
 ## State Management
 
 A single `session` dict (from `_new_session()`) is the source of truth for one
 interaction. Each step writes its output into the dict; the next step reads from
-it rather than passing loose variables. Fields: `query`, `parsed`,
-`search_results`, `selected_item`, `wardrobe`, `outfit_suggestion`, `fit_card`,
-`error`. `app.py`'s `handle_query` maps the finished session to the three UI
-panels; a non-`None` `error` short-circuits to panel 1.
+it rather than passing loose variables. Fields:
+
+| Field | Type | Set by |
+|-------|------|--------|
+| `query` | `str` | `_new_session` |
+| `parsed` | `dict` | `parse_query` |
+| `search_results` | `list` | `search_listings` / `refine_search` |
+| `selected_item` | `dict \| None` | loop (step 4) |
+| `wardrobe` | `dict` | `_new_session` |
+| `outfit_suggestion` | `str \| None` | `suggest_outfit` |
+| `fit_card` | `str \| None` | `create_fit_card` |
+| `error` | `str \| None` | loop (no-results / exception) |
+| `notice` | `str \| None` | loop (stretch A — relaxation message) |
+| `price_check` | `str \| None` | `compare_price` (stretch B) |
+| `trends` | `str \| None` | `get_trends` (stretch D) |
+
+`app.py`'s `handle_query` maps the finished session to **five** UI panels. A
+non-`None` `error` short-circuits to panel 1; a non-`None` `notice` is prepended
+to the listing panel as a `⚠️` warning.
 
 **Query parsing:** the LLM (Groq JSON mode) extracts the four parsed fields,
 keying on the item the user *wants* (not pieces they say they already own/wear)
 and tagging a `category`. A deterministic regex parser is the fallback if the LLM
 call errors or returns malformed JSON, so the agent never crashes.
+
+**Style profile memory (stretch C):** `utils/profile.py` persists the user's
+wardrobe and accumulated preferences (last size, price ceiling, categories, and
+style keywords) to `data/style_profile.json`. `app.py` exposes this as a third
+wardrobe choice ("My saved profile") and a **💾 Save wardrobe to my profile**
+button. Preferences update after each successful query when the saved-profile
+option is selected.
 
 ## Error Handling (per tool)
 
@@ -143,7 +178,9 @@ Each tool owns its failure mode, so the loop needs no `try/except` wrapper. Exam
 | `search_listings` | No match | returns `[]` (no exception) | `search_listings("designer ballgown", size="XXS", max_price=5)` → `[]` (`test_search_empty_results`) |
 | `suggest_outfit` | Empty wardrobe | general styling advice, not an error | empty wardrobe + graphic tee → "…pair it with high-waisted jeans and black combat boots…" (general advice, no owned pieces named) |
 | `create_fit_card` | Empty/whitespace outfit | descriptive error string, no LLM call | `create_fit_card("", item)` → `"Can't write a fit card without an outfit suggestion."` (`test_create_fit_card_empty_outfit`) |
-| `refine_search` | All stages exhausted | returns `[]`; loop reports a helpful no-results message | `refine_search({"description":"designer ballgown", ...})` → `[]` (`test_refine_search_exhausted_returns_empty`) |
+| `refine_search` | All stages exhausted | returns `([], None)`; loop reports a helpful no-results message | `refine_search({"description":"designer ballgown", ...})` → `([], None)` (`test_refine_search_exhausted_returns_empty`) |
+| `compare_price` | Fewer than 2 comparables | friendly "not enough data" string, no crash | `compare_price({"id":"x","category":"spacesuits","price":999})` → `"Not enough comparable listings to price-check this."` (`test_compare_price_not_enough_comparables`) |
+| `get_trends` | No listings in size | graceful empty-ish string, no crash | extremely rare size returns a no-data message rather than raising a `KeyError` |
 
 End-to-end, the no-results path surfaces to the user as:
 `"No listings matched 'designer ballgown'. Try fewer keywords, a higher price, or removing the size filter."`
@@ -154,7 +191,7 @@ The implementation follows `planning.md`, with three changes made during develop
 
 - **Query parsing: regex → LLM (with regex fallback).** The spec originally chose pure regex parsing. The query *"I wear shorts, I want a button shirt under $40"* leaked "shorts" into the search and returned shorts instead of a shirt — regex can't separate "what I want" from "what I wear." Switched to LLM parsing (the stub explicitly allows it) and updated `planning.md` to match; kept the regex as a fallback for robustness.
 - **Added a `category` filter.** *"white shirt"* then returned off-white *sneakers*, because the color word "white" in a shoe's title outscored matching the item type. The LLM now tags a `category` and `search_listings` filters by it, so a shirt request can't return shoes. This was a *ranking* bug, distinct from the no-results case `refine_search` handles.
-- **`refine_search` simplified.** The spec listed `refine_search(parsed, attempted)` with a "broaden keywords" stage. The `attempted` parameter proved unnecessary (a single call walks all stages), and keyword-broadening is a no-op for our OR-based scorer (if the full description matches nothing, no single token would either). Final stages: drop size → drop price → relax category. `planning.md` was corrected to reflect this.
+- **`refine_search` simplified and its return type changed.** The spec listed `refine_search(parsed, attempted)` with a "broaden keywords" stage. The `attempted` parameter proved unnecessary (a single call walks all stages), and keyword-broadening is a no-op for our OR-based scorer. Final stages: drop size → drop price → relax category. The return type was later changed from `list[dict]` to `tuple[list[dict], str | None]` to carry the adjustment label for the retry notice UI.
 
 The tool contracts, the linear-loop-with-retry-branch, the session-dict state model, and the per-tool error handling all matched the spec as written.
 

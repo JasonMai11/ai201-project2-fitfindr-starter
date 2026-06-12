@@ -16,6 +16,21 @@ import gradio as gr
 
 from agent import run_agent
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+from utils.profile import load_profile, save_profile, update_preferences
+
+# Wardrobe radio choices.
+WARDROBE_EXAMPLE = "Example wardrobe"
+WARDROBE_EMPTY = "Empty wardrobe (new user)"
+WARDROBE_PROFILE = "My saved profile"
+
+
+def _select_wardrobe(wardrobe_choice: str) -> dict:
+    """Resolve the radio choice to an actual wardrobe dict."""
+    if wardrobe_choice == WARDROBE_EXAMPLE:
+        return get_example_wardrobe()
+    if wardrobe_choice == WARDROBE_PROFILE:
+        return load_profile()["wardrobe"]
+    return get_empty_wardrobe()
 
 
 # ── query handler ─────────────────────────────────────────────────────────────
@@ -35,49 +50,56 @@ def _format_listing(item: dict) -> str:
     return "\n".join(lines)
 
 
-def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
+def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str, str, str]:
     """
     Called by Gradio when the user submits a query.
 
-    Args:
-        user_query:     The text the user typed into the search box.
-        wardrobe_choice: Either "Example wardrobe" or "Empty wardrobe (new user)".
-
-    Returns:
-        A tuple of three strings:
-            (listing_text, outfit_suggestion, fit_card)
-        Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
+    Returns five strings mapped to the output panels:
+        (listing_text, outfit_suggestion, fit_card, price_check, trends)
+    The listing panel is prefixed with a retry notice when refine_search had to
+    loosen constraints. On error, the message goes in panel 1 and the rest blank.
     """
     # 1. Guard against an empty query.
     if not user_query or not user_query.strip():
-        return "Please enter what you're looking for.", "", ""
+        return "Please enter what you're looking for.", "", "", "", ""
 
     # 2. Select the wardrobe based on the radio choice.
-    if wardrobe_choice == "Example wardrobe":
-        wardrobe = get_example_wardrobe()
-    else:
-        wardrobe = get_empty_wardrobe()
+    wardrobe = _select_wardrobe(wardrobe_choice)
 
     # 3. Run the agent.
     session = run_agent(user_query, wardrobe)
 
     # 4. On error, show the message in the first panel only.
     if session["error"]:
-        return session["error"], "", ""
+        return session["error"], "", "", "", ""
 
-    # 5. Format the results for the three panels.
+    # 5. If this is the saved profile, remember the refined preferences (stretch C).
+    if wardrobe_choice == WARDROBE_PROFILE:
+        profile = load_profile()
+        update_preferences(profile, session["parsed"])
+        save_profile(profile)
+
+    # 6. Format the results for the five panels.
     listing_text = _format_listing(session["selected_item"])
-    return listing_text, session["outfit_suggestion"], session["fit_card"]
+    if session["notice"]:
+        listing_text = f"⚠️ {session['notice']}\n\n{listing_text}"
+    return (
+        listing_text,
+        session["outfit_suggestion"],
+        session["fit_card"],
+        session["price_check"] or "",
+        session["trends"] or "",
+    )
+
+
+def save_wardrobe_to_profile(wardrobe_choice: str) -> str:
+    """Persist the currently-selected wardrobe as the user's saved profile."""
+    wardrobe = _select_wardrobe(wardrobe_choice)
+    profile = load_profile()
+    profile["wardrobe"] = wardrobe
+    save_profile(profile)
+    count = len(wardrobe.get("items", []))
+    return f"✅ Saved {count} item(s) to your profile — pick “{WARDROBE_PROFILE}” to reuse them."
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
@@ -106,13 +128,16 @@ Describe what you're looking for — include size and price if you want to filte
                 scale=3,
             )
             wardrobe_choice = gr.Radio(
-                choices=["Example wardrobe", "Empty wardrobe (new user)"],
-                value="Example wardrobe",
+                choices=[WARDROBE_EXAMPLE, WARDROBE_EMPTY, WARDROBE_PROFILE],
+                value=WARDROBE_EXAMPLE,
                 label="Wardrobe",
                 scale=1,
             )
 
-        submit_btn = gr.Button("Find it", variant="primary")
+        with gr.Row():
+            submit_btn = gr.Button("Find it", variant="primary", scale=3)
+            save_btn = gr.Button("💾 Save wardrobe to my profile", scale=1)
+        profile_status = gr.Markdown("")
 
         with gr.Row():
             listing_output = gr.Textbox(
@@ -131,22 +156,28 @@ Describe what you're looking for — include size and price if you want to filte
                 interactive=False,
             )
 
+        with gr.Row():
+            price_output = gr.Textbox(
+                label="💰 Price check",
+                lines=3,
+                interactive=False,
+            )
+            trends_output = gr.Textbox(
+                label="🔥 Trending in your size",
+                lines=3,
+                interactive=False,
+            )
+
         gr.Examples(
             examples=[[q, "Example wardrobe"] for q in EXAMPLE_QUERIES],
             inputs=[query_input, wardrobe_choice],
             label="Try these queries",
         )
 
-        submit_btn.click(
-            fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
-        )
-        query_input.submit(
-            fn=handle_query,
-            inputs=[query_input, wardrobe_choice],
-            outputs=[listing_output, outfit_output, fitcard_output],
-        )
+        outputs = [listing_output, outfit_output, fitcard_output, price_output, trends_output]
+        submit_btn.click(fn=handle_query, inputs=[query_input, wardrobe_choice], outputs=outputs)
+        query_input.submit(fn=handle_query, inputs=[query_input, wardrobe_choice], outputs=outputs)
+        save_btn.click(fn=save_wardrobe_to_profile, inputs=[wardrobe_choice], outputs=[profile_status])
 
     return demo
 

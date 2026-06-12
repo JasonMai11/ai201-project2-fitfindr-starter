@@ -14,6 +14,8 @@ Tools:
 
 import os
 import re
+import statistics
+from collections import Counter
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -291,14 +293,20 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
 # ── Stretch tool: refine_search ───────────────────────────────────────────────
 
-def refine_search(parsed: dict) -> list[dict]:
+def refine_search(parsed: dict) -> tuple[list[dict], str | None]:
     """
     Retry search_listings with progressively relaxed constraints when the
-    original search returned nothing. Returns the first non-empty result, or
-    an empty list if every relaxation is exhausted.
+    original search returned nothing.
 
     Args:
         parsed: the parsed query dict {description, size, max_price, category}.
+
+    Returns:
+        A tuple (results, adjustment):
+          - results:    the first non-empty match list, or [] if all exhausted.
+          - adjustment: a short label of what was loosened at the successful
+                        stage (e.g. "removed the size filter"), or None if
+                        nothing was found. Used to tell the user what changed.
 
     Relaxation stages (least drastic first; stop at the first that finds items):
         1. drop the size filter   (keep price + category)
@@ -318,18 +326,104 @@ def refine_search(parsed: dict) -> list[dict]:
     if size is not None:
         results = search_listings(description, None, max_price, category)
         if results:
-            return results
+            return results, "removed the size filter"
 
     # Stage 2: drop price (and size).
     if max_price is not None:
         results = search_listings(description, None, None, category)
         if results:
-            return results
+            relaxed = "size and price filters" if size is not None else "price filter"
+            return results, f"removed the {relaxed}"
 
     # Stage 3: relax category (description only).
     if category is not None:
         results = search_listings(description, None, None, None)
         if results:
-            return results
+            return results, "searched across all categories"
 
-    return []
+    return [], None
+
+
+# ── Stretch tool: compare_price ───────────────────────────────────────────────
+
+def compare_price(item: dict, listings: list[dict] | None = None) -> str:
+    """
+    Estimate whether an item's price is fair by comparing it to comparable
+    listings (same category) in the dataset.
+
+    Args:
+        item:     the listing to price-check (needs price, category, id).
+        listings: pool to compare against; defaults to all listings.
+
+    Returns:
+        A short verdict string, e.g.
+        "At $24, this is a good price — similar tops run $18–$45 (typical ~$28)."
+        If there are fewer than 2 comparable listings, returns a friendly
+        "not enough data" message instead of raising.
+    """
+    if listings is None:
+        listings = load_listings()
+
+    comparables = [
+        l for l in listings
+        if l["category"] == item.get("category") and l.get("id") != item.get("id")
+    ]
+    if len(comparables) < 2:
+        return "Not enough comparable listings to price-check this."
+
+    prices = sorted(l["price"] for l in comparables)
+    low, high = prices[0], prices[-1]
+    typical = statistics.median(prices)
+    price = item["price"]
+
+    if price <= typical * 0.85:
+        verdict = "a good price"
+    elif price <= typical * 1.15:
+        verdict = "about average"
+    else:
+        verdict = "on the higher side"
+
+    category = item.get("category", "items")
+    return (
+        f"At ${price:g}, this is {verdict} — similar {category} run "
+        f"${low:g}–${high:g} (typical ~${typical:g})."
+    )
+
+
+# ── Stretch tool: get_trends ──────────────────────────────────────────────────
+
+def get_trends(size: str | None = None, listings: list[dict] | None = None) -> str:
+    """
+    Surface the styles currently popular in the user's size range.
+
+    NOTE: there is no live external fashion platform in this offline project, so
+    "trends" are derived from the marketplace dataset — the most common style_tags
+    among current listings (optionally scoped to the user's size). This is clearly
+    framed to the user as coming from current listings, not a live feed.
+
+    Args:
+        size:     size to scope trends to (case-insensitive substring, like
+                  search_listings); None → trends across all listings.
+        listings: pool to analyze; defaults to all listings.
+
+    Returns:
+        A short string naming the top style tags, e.g.
+        "Trending in your size (from current listings): vintage, streetwear, y2k."
+        If no listings match the size, falls back to overall trends.
+    """
+    if listings is None:
+        listings = load_listings()
+
+    scoped = listings
+    scoped_by_size = False
+    if size is not None:
+        matched = [l for l in listings if size.lower() in l["size"].lower()]
+        if matched:
+            scoped = matched
+            scoped_by_size = True
+
+    tags = Counter(tag for l in scoped for tag in l["style_tags"])
+    top = [tag for tag, _ in tags.most_common(5)]
+
+    where = "in your size" if scoped_by_size else "right now"
+    return f"Trending {where} (from current listings): " + ", ".join(top) + "."

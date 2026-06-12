@@ -76,7 +76,7 @@ When `search_listings` finds nothing, this tool relaxes the search constraints i
 - `parsed` (dict): the parsed query fields (`description`, `size`, `max_price`, `category`) from the original attempt. The tool reads these and re-runs `search_listings` with some of them dropped.
 
 **What it returns:**
-A `list[dict]` of listings (same shape as `search_listings`), possibly still empty if every relaxation has been exhausted.
+A tuple `(results, adjustment)`: `results` is a `list[dict]` (same shape as `search_listings`, possibly empty if every relaxation is exhausted), and `adjustment` is a short human-readable label of what was loosened at the successful stage (e.g. `"removed the size filter"`) or `None` if nothing worked. The label powers the user-facing retry message (stretch feature A).
 
 **Relaxation stages (applied in order, stopping at the first that returns results):**
 1. Drop the `size` filter (keep price + category).
@@ -86,7 +86,35 @@ A `list[dict]` of listings (same shape as `search_listings`), possibly still emp
 *(Keyword-broadening is intentionally not a stage: `search_listings` keeps any listing matching ANY description token, so if the full description matches nothing, no single token would either.)*
 
 **What happens if it fails or returns nothing:**
-If all stages are exhausted and still nothing matches, it returns `[]`; the planning loop then sets `session["error"]` to a helpful message suggesting the user broaden their request.
+If all stages are exhausted and still nothing matches, it returns `([], None)`; the planning loop then sets `session["error"]` to a helpful message suggesting the user broaden their request.
+
+---
+
+## Stretch Features (extra credit)
+
+Four extra-credit features. The two new tools below follow the same four-field format as the required tools; all four stretch features are deterministic and offline except where they reuse the existing LLM parse.
+
+### A. Retry logic with user feedback
+`refine_search` (above) already retries with loosened constraints when `search_listings` is empty. This feature surfaces *what changed*: `refine_search` returns an `adjustment` label, and on a successful relaxation `run_agent` sets `session["notice"]` (e.g. *"No exact match — removed the size filter to find this."*), which `app.py` shows above the listing.
+
+### B. compare_price (price comparison tool)
+**What it does:** estimates whether a listing's price is fair by comparing it to comparable items in the dataset.
+**Input parameters:**
+- `item` (dict): the listing to price-check.
+- `listings` (list[dict] | None): the pool to compare against; defaults to all listings via `load_listings()`.
+**What it returns:** a short verdict string, e.g. *"At $24, this is a good price — similar tops run $18–$45 (typical ~$28)."*
+**What happens if it fails or returns nothing:** if fewer than 2 comparable listings exist (same category, excluding the item itself), it returns *"Not enough comparable listings to price-check this."* — no exception.
+
+### C. get_trends (trend awareness tool)
+**What it does:** surfaces the styles currently popular in the user's size range. *Trends are derived from the marketplace dataset* (the project is offline with no live public-platform feed) — the tool tallies `style_tags` across listings that match the size and returns the most common ones, clearly labeled as coming from current listings.
+**Input parameters:**
+- `size` (str | None): size to scope trends to (case-insensitive substring, like `search_listings`); `None` → overall trends.
+- `listings` (list[dict] | None): pool to analyze; defaults to `load_listings()`.
+**What it returns:** a string like *"Trending in your size (from current listings): streetwear, vintage, y2k, denim, grunge."*
+**What happens if it fails or returns nothing:** if no listings match the size, it falls back to overall trends rather than erroring.
+
+### D. Style profile memory
+A persisted profile (`data/style_profile.json`) lets a returning user reuse a saved wardrobe and accumulated preferences instead of re-describing them. `utils/profile.py` provides `load_profile()` (returns a default profile if the file is missing/corrupt — never raises), `save_profile(profile)`, and `update_preferences(profile, parsed)` (records the last size/price and accumulates category + style tokens). In the UI, a **"My saved profile"** wardrobe option loads it, and a **save** button persists the current wardrobe; after each successful run the profile's preferences are updated and saved.
 
 ---
 
@@ -121,8 +149,11 @@ Tracked fields:
 - `outfit_suggestion` — the string from `suggest_outfit`.
 - `fit_card` — the string from `create_fit_card`.
 - `error` — `None` on success; set to a message string if the interaction ended early.
+- `notice` *(stretch A)* — `None`, or a message about what `refine_search` loosened when there was no exact match.
+- `price_check` *(stretch B)* — the `compare_price` verdict for the selected item.
+- `trends` *(stretch D)* — the `get_trends` string for the user's size range.
 
-`app.py`'s `handle_query` calls `run_agent`, then maps the finished session to the three UI panels. If `session["error"]` is not `None`, it shows the error in panel 1 and leaves the other two panels empty.
+`app.py`'s `handle_query` calls `run_agent`, then maps the finished session to the UI panels (listing, outfit, fit card, plus the price-check and trends panels). If `session["error"]` is not `None`, it shows the error in panel 1 and leaves the others empty.
 
 ---
 

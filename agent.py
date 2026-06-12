@@ -26,6 +26,8 @@ from tools import (
     refine_search,
     suggest_outfit,
     create_fit_card,
+    compare_price,
+    get_trends,
     _get_groq_client,
     _MODEL,
 )
@@ -170,6 +172,9 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        "notice": None,              # what refine_search loosened, if anything (stretch A)
+        "price_check": None,         # compare_price verdict for the selected item (stretch B)
+        "trends": None,              # get_trends string for the user's size (stretch D)
     }
 
 
@@ -235,8 +240,11 @@ def run_agent(query: str, wardrobe: dict) -> dict:
 
     # No results → retry with relaxed constraints (stretch tool) before giving up.
     if not results:
-        results = refine_search(parsed)
+        results, adjustment = refine_search(parsed)
         session["search_results"] = results
+        if results:
+            # Tell the user what was loosened to find a match (stretch A).
+            session["notice"] = f"No exact match — {adjustment} to find this."
 
     # Still nothing → stop with a helpful message, before any LLM calls.
     if not results:
@@ -248,6 +256,10 @@ def run_agent(query: str, wardrobe: dict) -> dict:
 
     # Step 4: select the most relevant result.
     session["selected_item"] = results[0]
+
+    # Price-check the find and surface size-range trends (stretch B + D).
+    session["price_check"] = compare_price(session["selected_item"])
+    session["trends"] = get_trends(parsed["size"])
 
     # Step 5: suggest an outfit using the user's wardrobe.
     session["outfit_suggestion"] = suggest_outfit(session["selected_item"], wardrobe)
